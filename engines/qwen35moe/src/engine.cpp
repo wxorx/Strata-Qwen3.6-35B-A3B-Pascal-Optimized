@@ -43,6 +43,29 @@ T* dmalloc(size_t n) {
     return p;
 }
 
+// KV buffers take device memory first. When that no longer fits the GPU, they fall back to mapped
+// pinned host memory: the kernels keep receiving a device pointer (the UVA alias), so correctness is
+// unchanged and only attention throughput degrades. Oversized contexts complete instead of failing.
+void* dmalloc_try_bytes(size_t bytes) {
+    void* p = nullptr;
+    if (cudaMalloc(&p, bytes) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    CUDA_CHECK(cudaMemset(p, 0, bytes));
+    CUDA_CHECK(cudaStreamSynchronize(nullptr));
+    return p;
+}
+
+void* host_bytes(size_t bytes) {
+    void* host = nullptr;
+    CUDA_CHECK(cudaHostAlloc(&host, bytes, cudaHostAllocMapped));
+    std::memset(host, 0, bytes);
+    void* dev = nullptr;
+    CUDA_CHECK(cudaHostGetDevicePointer(&dev, host, 0));
+    return dev;   // under UVA dev == host; keep the device-side alias the kernels use
+}
+
 ActQ alloc_act(int n) {
     ActQ a;
     a.q = dmalloc<int8_t>(n);
@@ -105,6 +128,14 @@ Engine::~Engine() {
     if (prompt_full_complete_) cudaEventDestroy(prompt_full_complete_);
     if (event_graph_cpu_stream_) cudaStreamDestroy(event_graph_cpu_stream_);
     if (gdn_prompt_factors_) cudaFree(gdn_prompt_factors_);
+    if (kv_on_host_) {   // pinned host KV is released by the host allocator, not cudaFree
+        auto free_host = [&](void** slot) { if (*slot) { cudaFreeHost(*slot); *slot = nullptr; } };
+        for (size_t il = 0; il < kc_.size(); ++il) {
+            free_host((void**)&kc_[il]); free_host((void**)&vc_[il]);
+            free_host((void**)&kc_i8_[il]); free_host((void**)&vc_i8_[il]);
+            free_host((void**)&kc_scale_[il]); free_host((void**)&vc_scale_[il]);
+        }
+    }
 }
 
 bool Engine::init(const EngineOptions& opt, std::string& err) {
@@ -481,16 +512,50 @@ void Engine::alloc_state() {
         ck.hin = dmalloc<float>((size_t)kMaxT * c.n_embd);
     }
     int64_t off = 0;
+    if (kv_initial_tokens_ == 0) {
+        // Eager mode asked for the whole context up front. If that does not fit the GPU, start at the
+        // largest capacity that does and grow on demand; a request that outgrows the device triggers
+        // the host-memory overflow below instead of a fatal allocation.
+        int cap = kv_capacity_;
+        while (cap > 2048) {
+            const int64_t total = (int64_t)(c.n_attn_layers() + c.n_mtp) * 2 * (int64_t)c.n_head_kv * cap *
+                                  (kv_int8_ ? c.head_dim + 4 : c.head_dim * 2);
+            void* probe = dmalloc_try_bytes((size_t)total);
+            if (probe) {
+                CUDA_CHECK(cudaFree(probe));
+                break;
+            }
+            cap /= 2;
+        }
+        if (cap < kv_capacity_) {
+            kv_capacity_ = cap;
+            kv_initial_tokens_ = cap;
+            log("context %d does not fit the GPU in one KV allocation: starting at capacity %d, growing on demand",
+                opt_.ctx, cap);
+        }
+    }
+    // KV allocation with overflow: try the device first; on failure move whatever was already
+    // allocated to pinned host memory and continue there. (A context larger than the GPU's memory
+    // becomes a slow-but-successful request instead of a fatal one.)
+    auto kv_at = [&](void** slot, size_t bytes) {
+        void* p = kv_on_host_ ? nullptr : dmalloc_try_bytes(bytes);
+        if (!p) {
+            if (!kv_on_host_) kv_switch_to_host(kv_capacity_);
+            p = host_bytes(bytes);
+        }
+        *slot = p;
+    };
     for (int il = 0; il < NL; ++il) {
         if (c.is_attn(il)) {
+            const size_t rows = (size_t)c.n_head_kv * (size_t)kv_capacity_;
             if (kv_int8_) {
-                kc_i8_[il] = dmalloc<int8_t>((size_t)c.n_head_kv * kv_capacity_ * c.head_dim);
-                vc_i8_[il] = dmalloc<int8_t>((size_t)c.n_head_kv * kv_capacity_ * c.head_dim);
-                kc_scale_[il] = dmalloc<float>((size_t)c.n_head_kv * kv_capacity_);
-                vc_scale_[il] = dmalloc<float>((size_t)c.n_head_kv * kv_capacity_);
+                kv_at((void**)&kc_i8_[il], rows * (size_t)c.head_dim * sizeof(int8_t));
+                kv_at((void**)&vc_i8_[il], rows * (size_t)c.head_dim * sizeof(int8_t));
+                kv_at((void**)&kc_scale_[il], rows * sizeof(float));
+                kv_at((void**)&vc_scale_[il], rows * sizeof(float));
             } else {
-                kc_[il] = dmalloc<uint16_t>((size_t)c.n_head_kv * kv_capacity_ * c.head_dim);
-                vc_[il] = dmalloc<uint16_t>((size_t)c.n_head_kv * kv_capacity_ * c.head_dim);
+                kv_at((void**)&kc_[il], rows * (size_t)c.head_dim * sizeof(uint16_t));
+                kv_at((void**)&vc_[il], rows * (size_t)c.head_dim * sizeof(uint16_t));
             }
         } else {
             conv_st_[il] = state_arena_ + off;
@@ -517,7 +582,9 @@ void Engine::alloc_state() {
         snap_arena_ = dmalloc<float>((size_t)opt_.mtp_draft * state_floats_);
     }
     const double kv_gib = kv_bytes() / 1073741824.0;
-    log("KV cache %.2f GiB (capacity %d / ctx %d), delta-net state %.0f MiB%s", kv_gib, kv_capacity_, opt_.ctx, state_floats_ * 4 / 1048576.0,
+    log("KV cache %.2f GiB (capacity %d / ctx %d)%s, delta-net state %.0f MiB%s", kv_gib, kv_capacity_, opt_.ctx,
+        kv_on_host_ ? " [pinned host memory: KV was too large for the GPU from the start]" : "",
+        state_floats_ * 4 / 1048576.0,
         mtp_on_ ? " (+ rollback snapshots)" : "");
 }
 
@@ -540,17 +607,48 @@ void Engine::ensure_kv_capacity(int tokens) {
     if (prompt_full_graph_) invalidate_prompt_full_graphs();
     // Initial lazy allocation gave these bytes to experts.  Return at least this much before growing KV,
     // so a populated expert cache cannot cause a full-context-size allocation on top of the old VRAM budget.
-    if (cache_bytes_ > 0) trim_cache(std::min(extra, cache_bytes_));
+    if (cache_bytes_ > 0 && !kv_on_host_) trim_cache(std::min(extra, cache_bytes_));
+    if (!kv_on_host_) {
+        // Probe the real cumulative need: each head row is freed before its larger replacement exists,
+        // so the sequence fits iff free VRAM covers the total delta minus one largest old buffer.
+        // If even that does not fit after evicting the expert cache, the whole KV moves to pinned host
+        // memory: the request completes with attention through PCIe instead of failing.
+        const size_t largest_old = (size_t)previous * (size_t)c.head_dim *
+                                   (kv_int8_ ? sizeof(int8_t) : sizeof(uint16_t)) * (size_t)c.n_head_kv;
+        const size_t need = extra > (int64_t)largest_old ? (size_t)(extra - (int64_t)largest_old) : 1;
+        void* probe = dmalloc_try_bytes(need);
+        if (probe) {
+            CUDA_CHECK(cudaFree(probe));
+        } else {
+            kv_switch_to_host(capacity);
+            kv_capacity_ = capacity;
+            log("KV capacity grew %d -> %d / %d tokens in pinned host memory: +%.1f MiB off the GPU, %.1f ms",
+                previous, capacity, opt_.ctx, extra / 1048576.0, now_ms() - started);
+            return;
+        }
+    }
     const size_t max_token_bytes = std::max<size_t>(c.head_dim * (kv_int8_ ? sizeof(int8_t) : sizeof(uint16_t)),
                                                    kv_int8_ ? sizeof(float) : 0);
     const size_t staging_bytes = (size_t)c.n_head_kv * previous * max_token_bytes;
     uint8_t* staging = nullptr;
-    CUDA_CHECK(cudaHostAlloc((void**)&staging, staging_bytes, cudaHostAllocDefault));
+    if (!kv_on_host_) CUDA_CHECK(cudaHostAlloc((void**)&staging, staging_bytes, cudaHostAllocDefault));
     auto grow_buffer = [&]<typename Element>(Element*& buffer, int elements_per_token) {
         if (!buffer) return;
         const size_t old_pitch = (size_t)previous * elements_per_token * sizeof(Element);
         const size_t new_pitch = (size_t)capacity * elements_per_token * sizeof(Element);
         const size_t old_bytes = old_pitch * c.n_head_kv, new_bytes = new_pitch * c.n_head_kv;
+        if (kv_on_host_) {   // overflow mode: copy head rows into a larger pinned host buffer, never onto the GPU
+            Element* grown = nullptr;
+            CUDA_CHECK(cudaHostAlloc((void**)&grown, new_bytes, cudaHostAllocMapped));
+            std::memset((void*)grown, 0, new_bytes);
+            for (int h = 0; h < c.n_head_kv; ++h)
+                std::memcpy((char*)grown + (size_t)h * new_pitch, (const char*)buffer + (size_t)h * old_pitch, old_pitch);
+            CUDA_CHECK(cudaFreeHost((void*)buffer));   // under UVA the device alias equals the host base
+            Element* dev = nullptr;
+            CUDA_CHECK(cudaHostGetDevicePointer((void**)&dev, (void*)grown, 0));
+            buffer = dev;
+            return;
+        }
         SQ_CHECK(old_bytes <= staging_bytes, "KV staging buffer is smaller than a head-row copy");
         // Preserve every old position, including pending MTP writes/checkpoint suffixes.  Only one K, V, or
         // scale buffer is staged at a time, and its old device allocation is freed before the larger one exists.
@@ -585,11 +683,53 @@ void Engine::ensure_kv_capacity(int tokens) {
             grow_buffer(vc_[layer], c.head_dim);
         }
     }
-    CUDA_CHECK(cudaFreeHost(staging));
+    if (staging) CUDA_CHECK(cudaFreeHost(staging));
     kv_capacity_ = capacity;
-    log("KV capacity grew %d -> %d / %d tokens: +%.1f MiB, expert cache %.1f -> %.1f MiB, %.1f ms",
-        previous, capacity, opt_.ctx, extra / 1048576.0, cache_before / 1048576.0, cache_bytes_ / 1048576.0,
+    log("KV capacity grew %d -> %d / %d tokens: +%.1f MiB%s, expert cache %.1f -> %.1f MiB, %.1f ms",
+        previous, capacity, opt_.ctx, extra / 1048576.0,
+        kv_on_host_ ? " into pinned host memory" : "", cache_before / 1048576.0, cache_bytes_ / 1048576.0,
         now_ms() - started);
+}
+
+// Move every allocated attention KV buffer to mapped pinned host memory at `new_capacity` and keep it
+// there. The kernels receive the UVA device alias, so only throughput changes: every KV access crosses
+// PCIe from now on. The freed device memory stays available for the expert cache and prefill.
+void Engine::kv_switch_to_host(int new_capacity) {
+    const Config& c = model_.cfg;
+    auto move = [&](void** slot, size_t elt_size, int64_t per_token_elems) {
+        void* buffer = *slot;
+        if (!buffer) return;
+        const size_t old_pitch = (size_t)kv_capacity_ * (size_t)per_token_elems * elt_size;
+        const size_t new_pitch = (size_t)new_capacity * (size_t)per_token_elems * elt_size;
+        const size_t new_bytes = new_pitch * (size_t)c.n_head_kv;
+        const size_t old_bytes = old_pitch * (size_t)c.n_head_kv;
+        void* grown = nullptr;
+        CUDA_CHECK(cudaHostAlloc(&grown, new_bytes, cudaHostAllocMapped));
+        std::memset(grown, 0, new_bytes);
+        // the current buffer is device memory here: copy the head rows through the DMA engine
+        CUDA_CHECK(cudaMemcpy2DAsync(grown, new_pitch, buffer, old_pitch, old_pitch, c.n_head_kv,
+                                     cudaMemcpyDeviceToHost, stream_));
+        CUDA_CHECK(cudaStreamSynchronize(stream_));
+        CUDA_CHECK(cudaFree(buffer));   // the buffer we are replacing is the device allocation
+        void* dev = nullptr;
+        CUDA_CHECK(cudaHostGetDevicePointer(&dev, grown, 0));
+        *slot = dev;
+    };
+    for (size_t il = 0; il < kc_.size(); ++il) {
+        if (kv_int8_) {
+            move((void**)&kc_i8_[il], sizeof(int8_t), c.head_dim);
+            move((void**)&vc_i8_[il], sizeof(int8_t), c.head_dim);
+            move((void**)&kc_scale_[il], sizeof(float), 1);
+            move((void**)&vc_scale_[il], sizeof(float), 1);
+        } else {
+            move((void**)&kc_[il], sizeof(uint16_t), c.head_dim);
+            move((void**)&vc_[il], sizeof(uint16_t), c.head_dim);
+        }
+    }
+    kv_on_host_ = true;
+    log("attention KV exceeded GPU memory: the KV cache now lives in pinned host RAM (capacity %d tokens). "
+        "Requests complete from here on, but attention reads cross PCIe and generation is slower.",
+        new_capacity);
 }
 
 // ================================================================================================= expert cache
@@ -2426,6 +2566,8 @@ std::string Engine::status_line() const {
                       (unsigned long long)stats.stream_max_pairs, (unsigned long long)stats.stream_zero_cpu_layers);
         result += transient;
     }
+    if (kv_on_host_)
+        result += "; KV on host RAM (overflow mode, attention reads cross PCIe)";
     return result;
 }
 

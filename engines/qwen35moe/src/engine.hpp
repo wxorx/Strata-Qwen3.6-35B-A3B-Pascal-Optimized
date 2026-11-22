@@ -200,6 +200,7 @@ private:
     void setup_miss_stream();                // freeze initially nonresident profile leaders after cache allocation
     int prepare_miss_stream(int layer, int T, cudaStream_t s); // partition completed mailbox, queue bounded DMA
     void ensure_kv_capacity(int tokens);      // grow backing storage without lowering the configured context
+    void kv_switch_to_host(int new_capacity); // move the attention KV to pinned host RAM (UVA device access)
     void rebalance_cache();                  // optional bounded capacity move at a quiescent adapt boundary
     void trim_cache(int64_t bytes);   // drop the coldest cached experts until at least `bytes` are freed
     void check_decode_launch(cudaStream_t s, int il, const char* stage);
@@ -340,6 +341,7 @@ private:
     // state
     std::vector<uint16_t*> kc_, vc_;          // per layer (null for delta-net layers)
     bool kv_int8_ = false;                  // explicit approximate KV opt-in; FP16 is the default
+    bool kv_on_host_ = false;               // KV overflow mode: the KV arrays live in pinned host RAM
     int kv_initial_tokens_ = 0;             // 0 reserves the full configured context as before
     int kv_capacity_ = 0;                   // allocated head stride, independent of opt_.ctx
     std::vector<int8_t*> kc_i8_, vc_i8_;
