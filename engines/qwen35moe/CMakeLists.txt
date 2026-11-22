@@ -11,6 +11,7 @@ project(strata_qwen35moe VERSION 0.1.0 LANGUAGES CXX CUDA)
 # llama.cpp's Pascal DP4A MMQ kernels.  It is deliberately opt-in so the proven
 # phase-switch executable remains byte-for-byte reproducible.
 option(SQ_ENABLE_PREFILL_MMQ "Use packed GGUF expert MMQ during batched prefill" OFF)
+option(SQ_ENABLE_MMQ_KQUANTS "Also cover Q4_K/Q5_K/Q5_1/Q6_K expert tensors in the MMQ path (Unsloth UD-Q4_K_M/XL GGUFs)" OFF)
 set(SQ_LLAMA_DIR "" CACHE PATH "Pinned llama.cpp checkout containing ggml/")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -87,6 +88,9 @@ if(SQ_ENABLE_PREFILL_MMQ)
   get_filename_component(_sq_qwen_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
   set(_sq_ggcuda "${SQ_LLAMA_DIR}/ggml/src/ggml-cuda")
   set(_sq_mmq_types q2_0 q2_k q3_k iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+  if(SQ_ENABLE_MMQ_KQUANTS)
+    list(APPEND _sq_mmq_types q4_k q5_k q5_1 q6_k)
+  endif()
   add_library(sq_prefill_mmq STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill_mmq.cu"
     "${_sq_qwen_root}/src/prefill/ggml_cuda_host.cu"
@@ -104,6 +108,9 @@ if(SQ_ENABLE_PREFILL_MMQ)
   endif()
   target_link_libraries(sq_prefill_mmq PUBLIC ggml-base CUDA::cudart_static)
   target_compile_definitions(sq_prefill_mmq PRIVATE STRATA_MMQ_Q23_K=1)
+  if(SQ_ENABLE_MMQ_KQUANTS)
+    target_compile_definitions(sq_prefill_mmq PRIVATE STRATA_MMQ_KQUANTS=1 STRATA_Q6K_EXPERTS=1)
+  endif()
   target_link_libraries(sq_core PUBLIC sq_prefill_mmq)
   target_compile_definitions(sq_core PUBLIC SQ_PREFILL_MMQ=1)
 endif()
