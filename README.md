@@ -120,6 +120,19 @@ profile itself is the tuned setting for the P1000: CUDA graphs, oversubscribed C
 (`--threads 12` measured 4.1 t/s), a CPU-side LM head, larger MMQ tiles, a bigger cache reserve and
 stronger cache adaptation all measured neutral or worse on this hardware.
 
+#### Long contexts and KV overflow (4 GB cards)
+
+`--max-context` is clamped to the model's own 262,144-token context. KV costs ~21.5 KiB per token
+in fp16, so the P1000 holds roughly **65K tokens of KV on the device** after evicting the expert
+cache; normal (25K-profile) speeds apply below that. Beyond it the engine no longer stops: the
+attention KV moves wholesale to **pinned host RAM** (the kernels keep a UVA device pointer, so
+results are unchanged; every KV access now crosses PCIe). Measured on this machine: a 30K-token
+request stays on-device (~15 t/s decode), a 50K request stays on-device with the expert cache
+evicted (~11 t/s), a 75K request overflows to host RAM (~45–50 t/s prefill, ~2–3 t/s decode) and
+completes. The status line marks the mode with `KV on host RAM (overflow mode)`. For sustained
+work above ~65K tokens the llama.cpp unified-memory configuration remains the faster choice; the
+overflow mode exists so an oversized request finishes instead of ending the engine.
+
 Images are not supported by this engine: its `--serve` answers `GENI` with an error, the server
 reports `"images": false`, and no `mmproj` file is loaded.
 
