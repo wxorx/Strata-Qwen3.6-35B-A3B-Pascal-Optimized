@@ -57,6 +57,41 @@ build-sm61\strata-qwen35moe.exe
 
 No prebuilt executable is committed.
 
+## Linux build for Pascal `sm_61`
+
+The engine needs no source changes on Linux: its CMake already carries GCC/POSIX branches and the
+C++/CUDA files are `#ifdef _WIN32`-guarded. Tested on Ubuntu 24.04 with gcc 13, CMake 3.28 and CUDA
+Toolkit 12.6 on a Quadro P1000 (`sm_61`).
+
+```sh
+./BUILD-PASCAL-SM61.sh     # fetches the same pinned llama.cpp, builds build-sm61/strata-qwen35moe
+./START-OPTIMIZED-PASCAL.sh ~/.llama.cpp/models/Qwen3.6-35B-A3B-UD-Q4_K_M/MTP/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+```
+
+`BUILD-PASCAL-SM61.sh` adds `-DSQ_ENABLE_MMQ_KQUANTS=ON`: a new opt-in gate that also compiles
+llama.cpp's `q4_k/q5_k/q5_1/q6_k` MMQ template instances behind the `STRATA_MMQ_KQUANTS` branches
+already present in `prefill_mmq.cu`. Without them the layer-major prefill refuses K-quant expert
+GGUFs (`fatal: layer-major prefill requires MMQ coverage for every main and MTP layer`), so only the
+IQ2/IQ3/Q2_K/Q3_K family — the `UD-IQ3_XXS` artifact measured above — can use the optimized path.
+The gate defaults to OFF in CMake, so the Windows build and its released binary are unchanged.
+`--selfcheck-layer-major` passes exactly (KL 0, identical argmax through continuation, MTP
+verification, rollback and prefix reuse) with the Q4_K MMQ path.
+
+`START-OPTIMIZED-PASCAL.sh` creates the `.venv` on first run, builds nothing, and starts the same
+launcher with the same engine options and environment as `START-OPTIMIZED-PASCAL.bat` (default context
+25000). It binds **0.0.0.0** so the web UI and the OpenAI/Anthropic APIs are reachable on the LAN;
+pass `--host 127.0.0.1` to keep it local-only.
+
+Measured on a Quadro P1000 (i7-8700T, 62 GB RAM, greedy, thinking on), `UD-Q4_K_M` with the
+MMQ+KQUANTS build: chat decode **27.7 t/s** (384-token answers),
+**18.5 t/s** output after an 18.5k-token prompt, **187.6 t/s** prefill at 8k — against llama.cpp
+b12387 on the same machine and model (its best profile, `--n-cpu-moe 37 --spec-type draft-mtp`):
+15.0 / 10.0 / 161.7 t/s. The published profile itself is the tuned setting; CUDA graphs, a second
+MMQ-free mode, oversubscribed CPU threads and other variations measured neutral or worse.
+
+Images are not supported by this engine: its `--serve` answers `GENI` with an error, the server
+reports `"images": false`, and no `mmproj` file is loaded.
+
 ## Prebuilt Windows release
 
 The `Windows Pascal release` GitHub Actions workflow builds the same `sm61` target with CUDA Toolkit 12.9. A pushed `v*` tag creates a GitHub Release containing a ZIP and its SHA-256 checksum. The ZIP contains the engine, required cuBLAS and Visual C++ runtime DLLs, the optimized launcher, and the web/API server. It does not contain the GGUF model.
