@@ -23,6 +23,40 @@ Test system: Intel Core i7-8750H, 48 GB RAM, Windows 11, NVIDIA driver 577.00. T
 
 The untouched original commit does not build for `sm61` or import all expert tensor types in this GGUF. Its measured row therefore uses the smallest required Pascal/import compatibility changes while retaining the original inference path. These are throughput measurements, not model-quality scores; the fixed-length document answers exposed factual or structural review flags across the tested engines.
 
+## Performance on the Quadro P1000 (Linux)
+
+Same machine, requests through each server's `/v1/chat/completions` with `temperature=0` and
+`cache_prompt=false`, single stream, on a **Quadro P1000 4 GB** (`sm_61`) under Ubuntu 24.04.
+llama.cpp rows use this machine's own production profiles with `llama.cpp` b12387 built for CUDA
+(`--n-cpu-moe 37`, q8_0 KV, FlashAttention, batch 4096/2048, `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`,
+196K context); the MTP row adds `--spec-type draft-mtp --spec-draft-n-max 2` on the MTP artifact.
+Strata runs `./BUILD-PASCAL-SM61.sh` (`SQ_ENABLE_PREFILL_MMQ=ON`, `SQ_ENABLE_MMQ_KQUANTS=ON`) and
+`./START-OPTIMIZED-PASCAL.sh` on the same MTP artifact, published profile, 25,088-token context,
+6 CPU threads. Documents are tokenized from this repository's own text: 8K ≈ 7.9K prompt tokens,
+16K ≈ 16.1K prompt tokens. Prefill rows answer 8 tokens; decode rows generate 256 tokens after the
+same document; Chat decode is three thinking-mode prompts (code, Japanese, math) at 384 tokens,
+six requests averaged. The plain llama.cpp row uses the non-MTP twin of the same quant.
+
+| Engine | 8K prefill | 8K decode | 16K prefill | 16K decode | Chat decode |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| llama.cpp b12387 (default profile, no drafts) | 182.65 t/s | 11.30 t/s | 158.45 t/s | 10.15 t/s | 13.09 t/s |
+| llama.cpp b12387 (`draft-mtp`, strongest tested) | 155.25 t/s | 11.14 t/s | 140.53 t/s | 9.39 t/s | 13.61 t/s |
+| **Strata Qwen3.6 Pascal Optimized** | **183.70 t/s** | **20.80 t/s** | 154.50 t/s | **17.40 t/s** | **26.43 t/s** |
+
+Against the strongest llama.cpp configuration on this card, the optimized build improves token
+generation by **+87% after 8K, +85% after 16K, +94% on chat** — about **2x** — while prefill is
+level with the plain profile and **+18% / +10%** against the MTP profile (draft layers cost
+llama.cpp prefill throughput). At 16K, Strata's prefill trails the plain profile slightly; its
+expert-cache and KV budgets are tighter at 4 GB than the 1050 Ti reference runs' because the P1000
+keeps a larger share of the model resident.
+
+Test system: Intel Core i7-8700T (6C/12T, AVX2), 62 GB RAM, Ubuntu 24.04, Quadro P1000 4 GB,
+NVIDIA driver 580.196.07, CUDA Toolkit 12.6.85. Each row is one measured pass (chat decode: 6
+requests; engine-level repeats of the profile varied by under 0.2%). These are throughput
+measurements, not model-quality scores; `--selfcheck-layer-major` passes exactly (KL 0, identical
+argmax across continuation, MTP verification, rollback and prefix reuse) for the Q4_K MMQ path on
+this hardware, and `docs/UNSLOTH_Q4.md`-style native expert quantization is kept throughout.
+
 ## Model
 
 Download the exact tested model from Hugging Face:
@@ -80,14 +114,11 @@ verification, rollback and prefix reuse) with the Q4_K MMQ path.
 `START-OPTIMIZED-PASCAL.sh` creates the `.venv` on first run, builds nothing, and starts the same
 launcher with the same engine options and environment as `START-OPTIMIZED-PASCAL.bat` (default context
 25000). It binds **0.0.0.0** so the web UI and the OpenAI/Anthropic APIs are reachable on the LAN;
-pass `--host 127.0.0.1` to keep it local-only.
-
-Measured on a Quadro P1000 (i7-8700T, 62 GB RAM, greedy, thinking on), `UD-Q4_K_M` with the
-MMQ+KQUANTS build: chat decode **27.7 t/s** (384-token answers),
-**18.5 t/s** output after an 18.5k-token prompt, **187.6 t/s** prefill at 8k — against llama.cpp
-b12387 on the same machine and model (its best profile, `--n-cpu-moe 37 --spec-type draft-mtp`):
-15.0 / 10.0 / 161.7 t/s. The published profile itself is the tuned setting; CUDA graphs, a second
-MMQ-free mode, oversubscribed CPU threads and other variations measured neutral or worse.
+pass `--host 127.0.0.1` to keep it local-only. Measurements for this card are tabulated under
+[Performance on the Quadro P1000 (Linux)](#performance-on-the-quadro-p1000-linux). The published
+profile itself is the tuned setting for the P1000: CUDA graphs, oversubscribed CPU threads
+(`--threads 12` measured 4.1 t/s), a CPU-side LM head, larger MMQ tiles, a bigger cache reserve and
+stronger cache adaptation all measured neutral or worse on this hardware.
 
 Images are not supported by this engine: its `--serve` answers `GENI` with an error, the server
 reports `"images": false`, and no `mmproj` file is loaded.
